@@ -1,0 +1,205 @@
+{
+  "name": "sparkrun",
+  "displayName": "SparkRun",
+  "description": "Multi-module Spring Boot / Vue launcher (Rust sidecar)",
+  "version": "0.1.0",
+  "publisher": "ypyh",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "sparkrun",
+          "title": "SparkRun",
+          "icon": "media/sparkrun.svg"
+        }
+      ]
+    },
+    "views": {
+      "sparkrun": [
+        {
+          "id": "sparkrun.units",
+          "name": "Launchable Units"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "sparkrun.scan",
+        "title": "SparkRun: Scan Workspace",
+        "icon": "$(search)"
+      },
+      {
+        "command": "sparkrun.start",
+        "title": "SparkRun: Start Unit",
+        "icon": "$(play)"
+      },
+      {
+        "command": "sparkrun.stop",
+        "title": "SparkRun: Stop Unit",
+        "icon": "$(debug-stop)"
+      },
+      {
+        "command": "sparkrun.refreshRunning",
+        "title": "SparkRun: Refresh Running",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "sparkrun.openLog",
+        "title": "SparkRun: Open Log"
+      },
+      {
+        "command": "sparkrun.detectToolchain",
+        "title": "SparkRun: Detect Toolchain"
+      },
+      {
+        "command": "sparkrun.build",
+        "title": "SparkRun: Build Unit",
+        "icon": "$(package)"
+      },
+      {
+        "command": "sparkrun.installLocalDeps",
+        "title": "SparkRun: Install Local Deps"
+      },
+      {
+        "command": "sparkrun.selectWorkspaceFolder",
+        "title": "SparkRun: Select Workspace Folder"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "sparkrun.scan",
+          "when": "view == sparkrun.units",
+          "group": "navigation"
+        },
+        {
+          "command": "sparkrun.refreshRunning",
+          "when": "view == sparkrun.units",
+          "group": "navigation"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "sparkrun.start",
+          "when": "view == sparkrun.units && viewItem =~ /idle|stopped|failed/",
+          "group": "inline"
+        },
+        {
+          "command": "sparkrun.stop",
+          "when": "view == sparkrun.units && viewItem =~ /starting|running/",
+          "group": "inline"
+        },
+        {
+          "command": "sparkrun.openLog",
+          "when": "view == sparkrun.units",
+          "group": "1_run"
+        },
+        {
+          "command": "sparkrun.build",
+          "when": "view == sparkrun.units && viewItem =~ /springBoot/",
+          "group": "1_run"
+        },
+        {
+          "command": "sparkrun.installLocalDeps",
+          "when": "view == sparkrun.units && viewItem =~ /springBoot/",
+          "group": "1_run"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "SparkRun",
+      "properties": {
+        "sparkrun.sidecarPath": {
+          "type": "string",
+          "default": "",
+          "description": "Path to sparkrun-sidecar binary. Empty = bundled bin/ or workspace target/debug."
+        },
+        "sparkrun.javaHome": {
+          "type": "string",
+          "default": "",
+          "description": "JAVA_HOME override"
+        },
+        "sparkrun.mavenHome": {
+          "type": "string",
+          "default": "",
+          "description": "MAVEN_HOME override"
+        },
+        "sparkrun.nodeHome": {
+          "type": "string",
+          "default": "",
+          "description": "NODE_HOME override"
+        },
+        "sparkrun.mavenRepoUrl": {
+          "type": "string",
+          "default": "",
+          "description": "Maven remote repository / mirror URL"
+        },
+        "sparkrun.mavenLocalRepo": {
+          "type": "string",
+          "default": "",
+          "description": "Maven local repository directory"
+        },
+        "sparkrun.buildBeforeRun": {
+          "type": "string",
+          "enum": [
+            "smart",
+            "always",
+            "never"
+          ],
+          "default": "smart",
+          "description": "Compile strategy before starting Spring Boot"
+        },
+        "sparkrun.enableSpringBoot": {
+          "type": "boolean",
+          "default": true
+        },
+        "sparkrun.enableVue": {
+          "type": "boolean",
+          "default": true
+        },
+        "sparkrun.scanDepth": {
+          "type": "number",
+          "default": 0,
+          "description": "Scan depth (0 = default 3)"
+        },
+        "sparkrun.hotReload": {
+          "type": "boolean",
+          "default": false,
+          "description": "Incremental compile on save for running Boot units"
+        },
+        "sparkrun.hotReloadRestart": {
+          "type": "boolean",
+          "default": false,
+          "description": "After hot-reload compile, touch DevTools .reloadtrigger"
+        },
+        "sparkrun.stopUnitsOnDeactivate": {
+          "type": "boolean",
+          "default": true,
+          "description": "Stop sidecar-managed units when the extension deactivates"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "package": "vsce package --no-dependencies"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.85.0",
+    "@vscode/vsce": "^3.2.0",
+    "typescript": "^5.4.0"
+  }
+}

@@ -1,0 +1,15 @@
+[package]
+name = "sparkrun-sidecar"
+version.workspace = true
+edition.workspace = true
+description = "SparkRun NDJSON sidecar for VS Code / Cursor"
+
+[[bin]]
+name = "sparkrun-sidecar"
+path = "src/main.rs"
+
+[dependencies]
+sparkrun-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }

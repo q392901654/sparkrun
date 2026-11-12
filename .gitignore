@@ -12,6 +12,10 @@ dist
 dist-ssr
 *.local
 src-tauri/target
+/target
+extensions/vscode/bin/
+extensions/vscode/out/
+extensions/vscode/*.vsix
 
 # Editor directories and files
 .vscode/*

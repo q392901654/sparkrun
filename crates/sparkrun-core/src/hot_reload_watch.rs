@@ -1,19 +1,11 @@
 //! Watch project sources for external editors (IDEA / Cursor).
 //! Launcher's own editor save already calls `hot_reload_compile`; this covers FS changes.
 
-use serde::Serialize;
+use crate::events::{HotReloadFsChange, LogEvent, SharedSink};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tauri::{AppHandle, Emitter};
-
-#[derive(Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct HotReloadFsChange {
-    pub project_id: String,
-    pub path: String,
-}
 
 struct WatchSession {
     project_id: String,
@@ -31,7 +23,7 @@ impl HotReloadWatchHub {
         }
     }
 
-    pub fn start(&self, app: AppHandle, project_id: String, root_path: String) -> Result<(), String> {
+    pub fn start(&self, sink: SharedSink, project_id: String, root_path: String) -> Result<(), String> {
         let root = PathBuf::from(crate::deps::normalize_path(&root_path));
         if !root.is_dir() {
             return Err(format!("watch root not a directory: {}", root.display()));
@@ -55,7 +47,7 @@ impl HotReloadWatchHub {
 
         std::thread::Builder::new()
             .name("hot-reload-watch".into())
-            .spawn(move || watch_loop(app, project_id_bg, root_bg, stop_bg))
+            .spawn(move || watch_loop(sink, project_id_bg, root_bg, stop_bg))
             .map_err(|e| format!("spawn watch thread: {e}"))?;
 
         let mut guard = self.session.lock().unwrap();
@@ -74,7 +66,7 @@ impl HotReloadWatchHub {
     }
 }
 
-fn watch_loop(app: AppHandle, project_id: String, root: PathBuf, stop: Arc<AtomicBool>) {
+fn watch_loop(sink: SharedSink, project_id: String, root: PathBuf, stop: Arc<AtomicBool>) {
     use notify::{Config, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 
     let (tx, rx) = std::sync::mpsc::channel();
@@ -86,41 +78,32 @@ fn watch_loop(app: AppHandle, project_id: String, root: PathBuf, stop: Arc<Atomi
     ) {
         Ok(w) => w,
         Err(e) => {
-            let _ = app.emit(
-                "module-log",
-                crate::process_mgr::LogEvent {
+            sink.emit_module_log(LogEvent {
                     unit_id: String::new(),
                     stream: "stderr".into(),
                     line: format!("[launcher] hot-reload watch failed to start: {e}"),
-                },
-            );
+                });
             return;
         }
     };
 
     if let Err(e) = watcher.watch(&root, RecursiveMode::Recursive) {
-        let _ = app.emit(
-            "module-log",
-            crate::process_mgr::LogEvent {
+        sink.emit_module_log(LogEvent {
                 unit_id: String::new(),
                 stream: "stderr".into(),
                 line: format!("[launcher] hot-reload watch {}: {e}", root.display()),
-            },
-        );
+            });
         return;
     }
 
-    let _ = app.emit(
-        "module-log",
-        crate::process_mgr::LogEvent {
+    sink.emit_module_log(LogEvent {
             unit_id: String::new(),
             stream: "stdout".into(),
             line: format!(
                 "[launcher] hot-reload: watching {} for .java/.yml/.properties (external IDE OK)",
                 root.display()
             ),
-        },
-    );
+        });
 
     let mut pending: Option<(PathBuf, Instant)> = None;
     let debounce = Duration::from_millis(700);
@@ -149,13 +132,10 @@ fn watch_loop(app: AppHandle, project_id: String, root: PathBuf, stop: Arc<Atomi
             if at.elapsed() >= debounce {
                 let path_str = path.to_string_lossy().to_string();
                 pending = None;
-                let _ = app.emit(
-                    "hot-reload-fs-change",
-                    HotReloadFsChange {
+                sink.emit_hot_reload_fs_change(HotReloadFsChange {
                         project_id: project_id.clone(),
                         path: path_str,
-                    },
-                );
+                    });
             }
         }
     }

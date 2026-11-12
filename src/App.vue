@@ -81,7 +81,7 @@ const LogXterm = defineAsyncComponent(() => import("./LogXterm.vue"));
 const TerminalPane = defineAsyncComponent(() => import("./TerminalPane.vue"));
 const SearchEverywhere = defineAsyncComponent(() => import("./SearchEverywhere.vue"));
 const ProjectFileTree = defineAsyncComponent(() => import("./ProjectFileTree.vue"));
-const GitPane = defineAsyncComponent(() => import("./GitPane.vue"));
+const JobCenter = defineAsyncComponent(() => import("./JobCenter.vue"));
 
 /** Prefetch editor/terminal chunks after first paint (does not block shell). */
 function prefetchHeavyChunks() {
@@ -462,8 +462,8 @@ function onHSplitPointerUp() {
   localStorage.setItem(SIDE_SPLIT_KEY, String(Math.round(sideSplitPct.value)));
 }
 
-/** workspace = daily home; settings = secondary; git = repo pane */
-const view = ref<"workspace" | "settings" | "git">("workspace");
+/** workspace = daily home; settings = secondary */
+const view = ref<"workspace" | "settings">("workspace");
 const settingsSection = ref<"project" | "toolchain" | "appearance">("project");
 const moreOpen = ref(false);
 
@@ -716,6 +716,8 @@ const projectOverrideOpen = computed(
 const scanMetaByProject = reactive<Record<string, { scannedAt: number }>>({});
 const statusTask = ref("");
 const statusBusy = ref(false);
+const jobCenterOpen = ref(false);
+const jobActiveCount = ref(0);
 const statusIndeterminate = ref(false);
 let statusIdleTimer: ReturnType<typeof setTimeout> | undefined;
 
@@ -918,6 +920,7 @@ let unlistenLog: UnlistenFn | undefined;
 let unlistenStatus: UnlistenFn | undefined;
 let unlistenScanProgress: UnlistenFn | undefined;
 let unlistenHotReloadFs: UnlistenFn | undefined;
+let unlistenJobs: UnlistenFn | undefined;
 
 const activeLogBuffer = computed(() => logs[activeUnitId.value] ?? []);
 const logBufferTotal = computed(() => activeLogBuffer.value.length);
@@ -1158,18 +1161,6 @@ function openSettings(section: "project" | "toolchain" | "appearance" = "project
 function openWorkspace() {
   view.value = "workspace";
   moreOpen.value = false;
-}
-
-function openGit() {
-  if (!activeProject.value) return;
-  view.value = "git";
-  moreOpen.value = false;
-}
-
-/** Open a path from Git pane (absolute or project-relative). */
-async function openFileFromGit(path: string) {
-  await loadFileIntoEditor(path);
-  // Keep Git view; user can switch to workspace to edit if needed
 }
 
 function startCreateFromGuide() {
@@ -1922,6 +1913,22 @@ onMounted(async () => {
         void triggerHotReloadCompile(path);
       },
     );
+    try {
+      const jl = await invoke<{ active: { id: string }[] }>("list_jobs");
+      jobActiveCount.value = jl.active?.length ?? 0;
+    } catch {
+      /* ignore */
+    }
+    unlistenJobs = await listen<{
+      status: string;
+    }>("job-updated", async () => {
+      try {
+        const jl = await invoke<{ active: { id: string }[] }>("list_jobs");
+        jobActiveCount.value = jl.active?.length ?? 0;
+      } catch {
+        /* ignore */
+      }
+    });
     void syncHotReloadFsWatch();
     prefetchHeavyChunks();
     await finishBoot(empty);
@@ -1959,6 +1966,7 @@ onUnmounted(() => {
   unlistenStatus?.();
   unlistenScanProgress?.();
   unlistenHotReloadFs?.();
+  unlistenJobs?.();
   unlistenWinResize?.();
   void invoke("stop_hot_reload_watch", { projectId: null }).catch(() => {});
 });
@@ -2016,16 +2024,6 @@ onUnmounted(() => {
           @click="openWorkspace"
         >
           工作区
-        </button>
-        <button
-          type="button"
-          class="nav-btn"
-          :class="{ active: view === 'git' }"
-          :disabled="!activeProject"
-          title="Git（分支 / 提交 / 合并）"
-          @click="openGit"
-        >
-          Git
         </button>
         <button
           type="button"
@@ -2679,20 +2677,6 @@ onUnmounted(() => {
           </div>
         </section>
 
-        <!-- ===== GIT ===== -->
-        <section v-show="view === 'git'" class="panel git-view fade-in">
-          <GitPane
-            v-if="activeProject"
-            :root-path="activeProject.rootPath"
-            :project-id="activeProject.id"
-            :dark="resolvedThemeMode(ui) === 'dark'"
-            @open-file="openFileFromGit"
-          />
-          <div v-else class="scan-empty">
-            <p>请先选择项目</p>
-          </div>
-        </section>
-
         <!-- ===== SETTINGS ===== -->
         <section v-show="view === 'settings'" class="panel settings fade-in">
           <div class="settings-layout">
@@ -3210,20 +3194,35 @@ onUnmounted(() => {
           }}</span>
         </template>
       </div>
-      <div class="status-mid" :title="statusTask">
+      <button
+        type="button"
+        class="status-mid status-jobs"
+        :title="statusTask || '打开任务中心'"
+        @click="jobCenterOpen = true"
+      >
         {{ statusTask || "就绪" }}
-      </div>
+        <span v-if="jobActiveCount > 0" class="job-badge">{{ jobActiveCount }}</span>
+      </button>
       <div class="status-right">
-        <div
-          v-if="statusBusy || scanning"
-          class="status-progress"
-          :class="{ indeterminate: statusIndeterminate || scanning }"
+        <button
+          type="button"
+          class="status-ready-btn"
+          title="任务中心"
+          @click="jobCenterOpen = true"
         >
-          <div class="status-progress-bar" />
-        </div>
-        <span v-else class="status-ready">Ready</span>
+          <div
+            v-if="statusBusy || scanning || jobActiveCount > 0"
+            class="status-progress"
+            :class="{ indeterminate: statusIndeterminate || scanning || jobActiveCount > 0 }"
+          >
+            <div class="status-progress-bar" />
+          </div>
+          <span v-else class="status-ready">Ready</span>
+        </button>
       </div>
     </footer>
+
+    <JobCenter :open="jobCenterOpen" @close="jobCenterOpen = false" />
 
     <SearchEverywhere
       v-if="activeProject"
@@ -3449,6 +3448,50 @@ code {
 }
 .status-sep {
   opacity: 0.55;
+}
+.status-jobs {
+  appearance: none;
+  border: none;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: center;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 0;
+  width: 100%;
+}
+.status-jobs:hover {
+  color: var(--text);
+}
+.job-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
+  border-radius: 8px;
+  font-size: 10px;
+  font-weight: 600;
+  background: color-mix(in srgb, var(--primary) 55%, transparent);
+  color: var(--text);
+}
+.status-ready-btn {
+  appearance: none;
+  border: none;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  width: 100%;
 }
 .status-mid {
   text-align: center;
@@ -3766,13 +3809,6 @@ code {
   flex-direction: column;
   min-height: 0;
   height: 100%;
-}
-.git-view {
-  display: flex;
-  flex-direction: column;
-  min-height: 0;
-  height: 100%;
-  padding: 0.55rem 0.65rem;
 }
 .fade-in {
   animation: fade 0.22s ease;

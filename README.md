@@ -32,7 +32,6 @@
 | 运行中 Tab | 每个运行中单元一个日志 Tab，点 Tab 切换输出 |
 | 健康信号 | 就绪（绿）、失败 / 端口占用（红），少翻日志确认 |
 | 日志与终端 | Boot：xterm 流式日志 + 级别过滤；Vue：内嵌 PTY 可输入 |
-| Git | 顶栏 **Git**：status / stage / commit / fetch·pull·push、分支检出与合并、stash；冲突时三方合并（Base / Ours / Theirs / Result） |
 
 ## 支持的单元类型
 
@@ -118,15 +117,6 @@ npm run tauri dev
 - **单击文件**直接在编辑器打开；路径落在某扫描单元下时自动选中该单元（供下方启停）  
 - 顶部下拉可切换当前运行单元并标星；标星文件快捷区仍按单元收藏  
 - 打开文件后（含全局搜索命中、切换 Tab）会 **reveal**：展开父目录、选中节点并滚入视野  
-
-### Git
-
-- 顶栏 **Git**（需已选项目；仓库根 = 项目 `rootPath`）  
-- **Files**：暂存 / 取消暂存 / 丢弃；选中查看 diff；提交（支持 Amend，仅当 HEAD 未推送或可安全改写时）  
-- **Branches**：检出、新建、**合并到当前分支**；Fetch / Pull / Push  
-- **冲突**：合并或 Pull 产生冲突时进入三方面板（Base / Ours / Theirs / Result）→ 写回并 Stage → **完成合并**；可 Abort  
-- **Commits / Stash**：查看 log / show；stash push / apply / drop  
-- 依赖本机 PATH 中的 `git`；未安装或不在仓库内会显示空态提示  
 
 ### 搜索所有地方
 
@@ -216,6 +206,16 @@ Agent / 编码硬约束见仓库 [`.cursor/rules/sparkrun-tauri-vue.mdc`](../.cu
 | CreateProcess / OS error 206 | Windows 命令行过长；启动器会尝试 classpath jar，仍失败可缩短工程路径 |
 
 同一单元一次启动周期内，同类引导只弹一次，避免日志刷屏。
+
+## VS Code / Cursor 扩展
+
+启动引擎已抽为 `crates/sparkrun-core`，并通过 `sparkrun-sidecar`（NDJSON stdio）给编辑器扩展复用。详见 [extensions/vscode/README.md](extensions/vscode/README.md)。
+
+```bash
+cargo build -p sparkrun-sidecar --release
+./scripts/copy-sidecar.ps1   # 或 scripts/copy-sidecar.sh
+cd extensions/vscode && npm install && npm run compile && npx vsce package --no-dependencies --allow-missing-repository
+```
 
 ## 获取帮助
 

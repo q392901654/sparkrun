@@ -1,18 +1,17 @@
 use crate::model::{Launchable, ScanCache};
-use crate::store::data_dir;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tauri::AppHandle;
+use std::path::Path;
 
-fn cache_dir(app: &AppHandle) -> Result<PathBuf, String> {
-    let dir = data_dir(app)?.join("scan-cache");
+fn cache_dir(data_dir: &Path) -> Result<PathBuf, String> {
+    let dir = data_dir.join("scan-cache");
     fs::create_dir_all(&dir).map_err(|e| format!("create scan-cache dir: {e}"))?;
     Ok(dir)
 }
 
-fn cache_path(app: &AppHandle, project_id: &str) -> Result<PathBuf, String> {
+fn cache_path(data_dir: &Path, project_id: &str) -> Result<PathBuf, String> {
     // Sanitize id for filesystem
     let safe: String = project_id
         .chars()
@@ -24,11 +23,11 @@ fn cache_path(app: &AppHandle, project_id: &str) -> Result<PathBuf, String> {
             }
         })
         .collect();
-    Ok(cache_dir(app)?.join(format!("{safe}.json")))
+    Ok(cache_dir(data_dir)?.join(format!("{safe}.json")))
 }
 
-pub fn load_scan_cache(app: &AppHandle, project_id: &str) -> Result<Option<ScanCache>, String> {
-    let path = cache_path(app, project_id)?;
+pub fn load_scan_cache(data_dir: &Path, project_id: &str) -> Result<Option<ScanCache>, String> {
+    let path = cache_path(data_dir, project_id)?;
     if !path.exists() {
         return Ok(None);
     }
@@ -38,14 +37,14 @@ pub fn load_scan_cache(app: &AppHandle, project_id: &str) -> Result<Option<ScanC
     Ok(Some(cache))
 }
 
-pub fn save_scan_cache(app: &AppHandle, cache: &ScanCache) -> Result<(), String> {
-    let path = cache_path(app, &cache.project_id)?;
+pub fn save_scan_cache(data_dir: &Path, cache: &ScanCache) -> Result<(), String> {
+    let path = cache_path(data_dir, &cache.project_id)?;
     let raw = serde_json::to_string_pretty(cache).map_err(|e| format!("serialize scan cache: {e}"))?;
     fs::write(&path, raw).map_err(|e| format!("write scan cache: {e}"))
 }
 
-pub fn clear_scan_cache(app: &AppHandle, project_id: &str) -> Result<(), String> {
-    let path = cache_path(app, project_id)?;
+pub fn clear_scan_cache(data_dir: &Path, project_id: &str) -> Result<(), String> {
+    let path = cache_path(data_dir, project_id)?;
     if path.exists() {
         fs::remove_file(&path).map_err(|e| format!("remove scan cache: {e}"))?;
     }
@@ -61,12 +60,12 @@ pub fn now_ms() -> u64 {
 
 /// After a fresh scan: write units + timestamp; keep selection fields from previous cache.
 pub fn save_units_after_scan(
-    app: &AppHandle,
+    data_dir: &Path,
     project_id: &str,
     root_path: &str,
     units: &[Launchable],
 ) -> Result<(), String> {
-    let prev = load_scan_cache(app, project_id)?.unwrap_or(ScanCache {
+    let prev = load_scan_cache(data_dir, project_id)?.unwrap_or(ScanCache {
         project_id: project_id.to_string(),
         root_path: root_path.to_string(),
         scanned_at: 0,
@@ -135,5 +134,5 @@ pub fn save_units_after_scan(
         starred_unit_ids,
         starred_files_by_unit,
     };
-    save_scan_cache(app, &cache)
+    save_scan_cache(data_dir, &cache)
 }

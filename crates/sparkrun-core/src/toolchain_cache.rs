@@ -1,13 +1,12 @@
 //! Disk cache for `discover_toolchain_homes` (env / PATH / known folders).
 //! Avoids repeating the same probe on every "查找" / idle warm within TTL.
 
-use crate::store::data_dir;
 use crate::toolchain::DiscoverToolchainHomes;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tauri::AppHandle;
+use std::path::Path;
 
 /// Freshness window for toolchain home discovery (~24h).
 pub const TTL_MS: u64 = 24 * 60 * 60 * 1000;
@@ -19,8 +18,8 @@ struct ToolchainHomesCacheFile {
     homes: DiscoverToolchainHomes,
 }
 
-fn cache_path(app: &AppHandle) -> Result<PathBuf, String> {
-    Ok(data_dir(app)?.join("toolchain-homes-cache.json"))
+fn cache_path(data_dir: &Path) -> Result<PathBuf, String> {
+    Ok(data_dir.join("toolchain-homes-cache.json"))
 }
 
 fn now_ms() -> u64 {
@@ -31,8 +30,8 @@ fn now_ms() -> u64 {
 }
 
 /// Return cached homes if file exists and is within TTL.
-pub fn load_if_fresh(app: &AppHandle) -> Result<Option<DiscoverToolchainHomes>, String> {
-    let path = cache_path(app)?;
+pub fn load_if_fresh(data_dir: &Path) -> Result<Option<DiscoverToolchainHomes>, String> {
+    let path = cache_path(data_dir)?;
     if !path.exists() {
         return Ok(None);
     }
@@ -46,8 +45,8 @@ pub fn load_if_fresh(app: &AppHandle) -> Result<Option<DiscoverToolchainHomes>, 
     Ok(Some(file.homes))
 }
 
-pub fn save(app: &AppHandle, homes: &DiscoverToolchainHomes) -> Result<(), String> {
-    let path = cache_path(app)?;
+pub fn save(data_dir: &Path, homes: &DiscoverToolchainHomes) -> Result<(), String> {
+    let path = cache_path(data_dir)?;
     let file = ToolchainHomesCacheFile {
         saved_at: now_ms(),
         homes: homes.clone(),

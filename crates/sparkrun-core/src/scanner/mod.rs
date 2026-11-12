@@ -118,10 +118,15 @@ pub fn walk_files<'a>(
     max_depth: usize,
     file_name: &'a str,
 ) -> impl Iterator<Item = PathBuf> + 'a {
+    // Never skip the scan root itself (e.g. folder named `sparkrun` / `project-launcher`).
+    let root_owned = root.to_path_buf();
     WalkDir::new(root)
         .max_depth(max_depth)
         .into_iter()
-        .filter_entry(|e| {
+        .filter_entry(move |e| {
+            if e.path() == root_owned {
+                return true;
+            }
             if e.file_type().is_dir() {
                 !should_skip_dir(&e.file_name().to_string_lossy())
             } else {

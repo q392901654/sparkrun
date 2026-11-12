@@ -4,19 +4,10 @@ use crate::model::RuntimeEnv;
 use crate::toolchain::build_path_env;
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use portable_pty::{native_pty_system, Child as PtyChild, CommandBuilder, MasterPty, PtySize};
-use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 use std::path::Path;
-use std::sync::Mutex;
-use tauri::{AppHandle, Emitter};
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TermDataEvent {
-    pub unit_id: String,
-    /// Base64-encoded raw PTY bytes (ANSI / binary-safe).
-    pub data: String,
-}
+use std::sync::{Arc, Mutex};
+use crate::events::{SharedSink, TermDataEvent};
 
 pub struct PtySession {
     child: Mutex<Box<dyn PtyChild + Send>>,
@@ -27,7 +18,7 @@ pub struct PtySession {
 
 impl PtySession {
     pub fn spawn(
-        app: AppHandle,
+        sink: SharedSink,
         unit_id: String,
         env: &RuntimeEnv,
         cwd: &Path,
@@ -85,20 +76,17 @@ impl PtySession {
             .map_err(|e| format!("pty writer: {e}"))?;
 
         let unit_for_reader = unit_id.clone();
-        let app_reader = app.clone();
+        let sink_reader = Arc::clone(&sink);
         std::thread::spawn(move || {
             let mut buf = [0u8; 4096];
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) => break,
                     Ok(n) => {
-                        let _ = app_reader.emit(
-                            "module-term",
-                            TermDataEvent {
+                        sink_reader.emit_module_term(TermDataEvent {
                                 unit_id: unit_for_reader.clone(),
                                 data: B64.encode(&buf[..n]),
-                            },
-                        );
+                            });
                     }
                     Err(_) => break,
                 }

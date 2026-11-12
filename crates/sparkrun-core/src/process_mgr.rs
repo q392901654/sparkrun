@@ -18,17 +18,7 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
-use tauri::{AppHandle, Emitter};
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub enum ModuleStatus {
-    Idle,
-    Starting,
-    Running,
-    Stopped,
-    Failed,
-}
+use crate::events::{LogEvent, ModuleStatus, SharedSink, StatusEvent};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -36,23 +26,6 @@ pub struct ModuleRuntime {
     pub unit_id: String,
     pub status: ModuleStatus,
     pub pid: Option<u32>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct LogEvent {
-    pub unit_id: String,
-    pub stream: String,
-    pub line: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct StatusEvent {
-    pub unit_id: String,
-    pub status: ModuleStatus,
-    pub pid: Option<u32>,
-    pub message: Option<String>,
 }
 
 enum ManagedProcess {
@@ -113,9 +86,11 @@ impl ProcessManager {
         }
     }
 
+    /// Compile (if needed) then spawn the process. Blocks until compile finishes and process is spawned
+    /// (does not wait for JVM/ready). Call from JobQueue `spawn_blocking`.
     pub fn start(
         self: &Arc<Self>,
-        app: AppHandle,
+        sink: SharedSink,
         env: RuntimeEnv,
         unit: Launchable,
         build_mode: BuildBeforeRun,
@@ -126,20 +101,13 @@ impl ProcessManager {
         // Reclaim leftover marker/process (e.g. frontend HMR cleared UI state but Rust still holds pid).
         self.reclaim_unit(&unit_id);
 
-        let _ = app.emit(
-            "module-status",
-            StatusEvent {
+        sink.emit_module_status(StatusEvent {
                 unit_id: unit_id.clone(),
                 status: ModuleStatus::Starting,
                 pid: None,
                 message: Some("starting".into()),
-            },
-        );
+            });
 
-        let mgr = Arc::clone(self);
-        let app_bg = app.clone();
-        let env_bg = env.clone();
-        let unit_bg = unit.clone();
         let profile = spring_profile
             .filter(|s| !s.trim().is_empty())
             .unwrap_or_else(|| unit.selected_spring_profile.clone());
@@ -147,7 +115,6 @@ impl ProcessManager {
         {
             let mut guard = self.inner.lock().unwrap();
             if guard.contains_key(&unit_id) {
-                // Extremely rare race: another start just inserted
                 return Err("unit already running".to_string());
             }
             let marker = spawn_marker(&env)?;
@@ -157,38 +124,33 @@ impl ProcessManager {
             );
         }
 
-        std::thread::spawn(move || {
-            let log = |stream: &str, line: String| {
-                let _ = app_bg.emit(
-                    "module-log",
-                    LogEvent {
-                        unit_id: unit_bg.id.clone(),
-                        stream: stream.into(),
-                        line,
-                    },
-                );
-            };
+        let log = |stream: &str, line: String| {
+            sink.emit_module_log(LogEvent {
+                    unit_id: unit.id.clone(),
+                    stream: stream.into(),
+                    line,
+                });
+        };
 
-            let result = match unit_bg.kind {
-                ProjectKind::SpringBoot => prepare_and_run_spring_boot(
-                    &mgr,
-                    &app_bg,
-                    &env_bg,
-                    &unit_bg,
-                    build_mode,
-                    &profile,
-                    hot_reload,
-                    &log,
-                ),
-                ProjectKind::Vue => prepare_and_run_vue(&mgr, &app_bg, &env_bg, &unit_bg, &log),
-            };
+        let result = match unit.kind {
+            ProjectKind::SpringBoot => prepare_and_run_spring_boot(
+                self,
+                &sink,
+                &env,
+                &unit,
+                build_mode,
+                &profile,
+                hot_reload,
+                &log,
+            ),
+            ProjectKind::Vue => prepare_and_run_vue(self, &sink, &env, &unit, &log),
+        };
 
-            if let Err(e) = result {
-                log("stderr", format!("[launcher] {e}"));
-                finish_failed(&mgr, &app_bg, &unit_bg.id);
-            }
-        });
-
+        if let Err(e) = result {
+            log("stderr", format!("[launcher] {e}"));
+            finish_failed(self, &sink, &unit.id);
+            return Err(e);
+        }
         Ok(())
     }
 
@@ -196,7 +158,7 @@ impl ProcessManager {
     /// If `restart` is true, also touch DevTools `.reloadtrigger` (full ApplicationContext restart).
     pub fn hot_reload_compile(
         &self,
-        app: &AppHandle,
+        sink: &SharedSink,
         env: &RuntimeEnv,
         unit: &Launchable,
         project_root: &str,
@@ -228,14 +190,11 @@ impl ProcessManager {
         let changed_file = PathBuf::from(normalize_path(&changed_canon.to_string_lossy()));
 
         let log = |stream: &str, line: String| {
-            let _ = app.emit(
-                "module-log",
-                LogEvent {
+            sink.emit_module_log(LogEvent {
                     unit_id: unit.id.clone(),
                     stream: stream.into(),
                     line,
-                },
-            );
+                });
         };
 
         let ext = changed_file
@@ -257,7 +216,7 @@ impl ProcessManager {
                 &module_dir,
                 &changed_file,
                 &unit.id,
-                app,
+                sink,
                 &log,
             ) {
                 Ok(()) => {
@@ -270,7 +229,7 @@ impl ProcessManager {
                             "[launcher] hot-reload javac failed ({e}); fallback incremental mvn compile"
                         ),
                     );
-                    if !mvn_incremental_compile(env, &module_dir, &unit.id, app, &log)? {
+                    if !mvn_incremental_compile(env, &module_dir, &unit.id, sink, &log)? {
                         return Err("hot-reload mvn compile failed".into());
                     }
                     let _ = write_compile_stamp(&module_dir);
@@ -278,7 +237,7 @@ impl ProcessManager {
             }
         } else if is_sources {
             // Kotlin / other: Maven with file-level incremental (not whole-module)
-            if !mvn_incremental_compile(env, &module_dir, &unit.id, app, &log)? {
+            if !mvn_incremental_compile(env, &module_dir, &unit.id, sink, &log)? {
                 return Err("hot-reload mvn compile failed".into());
             }
             let _ = write_compile_stamp(&module_dir);
@@ -292,7 +251,7 @@ impl ProcessManager {
             );
             let mvn = resolve_mvn_bin(env);
             let args = vec!["process-resources".into()];
-            let ok = run_command_streaming(env, &module_dir, &mvn, &args, &unit.id, app)?;
+            let ok = run_command_streaming(env, &module_dir, &mvn, &args, &unit.id, sink)?;
             if !ok {
                 return Err("hot-reload process-resources failed".into());
             }
@@ -325,10 +284,10 @@ impl ProcessManager {
         guard.contains_key(unit_id)
     }
 
-    /// Compile unit + local deps (no run). `force` ignores up-to-date checks.
+    /// Compile unit + local deps (no run). Blocks until finished. Call from JobQueue.
     pub fn build_unit(
         self: &Arc<Self>,
-        app: AppHandle,
+        sink: SharedSink,
         env: RuntimeEnv,
         unit: Launchable,
         force: bool,
@@ -337,137 +296,120 @@ impl ProcessManager {
             return Err("build is only supported for Spring Boot units".into());
         }
         let unit_id = unit.id.clone();
-        ensure_log_slot(&app, &unit_id);
-        std::thread::spawn(move || {
-            let log = |stream: &str, line: String| {
-                let _ = app.emit(
-                    "module-log",
-                    LogEvent {
-                        unit_id: unit.id.clone(),
-                        stream: stream.into(),
-                        line,
-                    },
-                );
-            };
-            let mode = if force {
-                BuildBeforeRun::Always
-            } else {
-                BuildBeforeRun::Smart
-            };
-            if let Err(e) = compile_spring_modules(&env, &unit, mode, &log, &app) {
-                log("stderr", format!("[launcher] build failed: {e}"));
-                let _ = app.emit(
-                    "module-status",
-                    StatusEvent {
-                        unit_id: unit.id.clone(),
-                        status: ModuleStatus::Failed,
-                        pid: None,
-                        message: Some(e),
-                    },
-                );
-            } else {
+        ensure_log_slot(&sink, &unit_id);
+        let log = |stream: &str, line: String| {
+            sink.emit_module_log(LogEvent {
+                    unit_id: unit.id.clone(),
+                    stream: stream.into(),
+                    line,
+                });
+        };
+        let mode = if force {
+            BuildBeforeRun::Always
+        } else {
+            BuildBeforeRun::Smart
+        };
+        match compile_spring_modules(&env, &unit, mode, &log, &sink) {
+            Ok(_) => {
                 log("stdout", "[launcher] build finished".into());
-                let _ = app.emit(
-                    "module-status",
-                    StatusEvent {
+                sink.emit_module_status(StatusEvent {
                         unit_id: unit.id.clone(),
                         status: ModuleStatus::Stopped,
                         pid: None,
                         message: Some("build ok".into()),
-                    },
-                );
+                    });
+                Ok(())
             }
-        });
-        Ok(())
+            Err(e) => {
+                log("stderr", format!("[launcher] build failed: {e}"));
+                sink.emit_module_status(StatusEvent {
+                        unit_id: unit.id.clone(),
+                        status: ModuleStatus::Failed,
+                        pid: None,
+                        message: Some(e.clone()),
+                    });
+                Err(e)
+            }
+        }
     }
 
-    /// Force `mvn install -DskipTests` for local deps of a Spring Boot unit (advanced).
+    /// Force `mvn install -DskipTests` for local deps. Blocks until finished.
     pub fn install_local_deps(
         self: &Arc<Self>,
-        app: AppHandle,
+        sink: SharedSink,
         env: RuntimeEnv,
         unit: Launchable,
     ) -> Result<(), String> {
         if unit.kind != ProjectKind::SpringBoot {
             return Err("install deps is only for Spring Boot units".into());
         }
-        std::thread::spawn(move || {
-            let log = |stream: &str, line: String| {
-                let _ = app.emit(
-                    "module-log",
-                    LogEvent {
-                        unit_id: unit.id.clone(),
-                        stream: stream.into(),
-                        line,
-                    },
-                );
-            };
-            let module_path = normalize_path(&unit.path);
-            let workspace = normalize_path(&env.workspace_path);
-            match resolve_local_install_order(Path::new(&workspace), Path::new(&module_path)) {
-                Ok(order) => {
-                    for dep_dir in order {
-                        let name = dep_dir
-                            .file_name()
-                            .map(|s| s.to_string_lossy().to_string())
-                            .unwrap_or_default();
-                        log(
-                            "stdout",
-                            format!("[launcher] mvn install -DskipTests @ {name}"),
-                        );
-                        match run_mvn_streaming(
-                            &env,
-                            &dep_dir,
-                            vec!["install".into(), "-DskipTests".into()],
-                            &unit.id,
-                            &app,
-                        ) {
-                            Ok(true) => {
-                                let _ = write_compile_stamp(&dep_dir);
-                                log("stdout", format!("[launcher] install OK: {name}"));
-                            }
-                            Ok(false) => {
-                                log("stderr", format!("[launcher] install FAILED: {name}"));
-                                return;
-                            }
-                            Err(e) => {
-                                log("stderr", format!("[launcher] {e}"));
-                                return;
-                            }
-                        }
-                    }
-                    log("stdout", "[launcher] install local deps finished".into());
+        let log = |stream: &str, line: String| {
+            sink.emit_module_log(LogEvent {
+                    unit_id: unit.id.clone(),
+                    stream: stream.into(),
+                    line,
+                });
+        };
+        let module_path = normalize_path(&unit.path);
+        let workspace = normalize_path(&env.workspace_path);
+        let order = resolve_local_install_order(Path::new(&workspace), Path::new(&module_path))
+            .map_err(|e| {
+                log("stderr", format!("[launcher] {e}"));
+                e
+            })?;
+        for dep_dir in order {
+            let name = dep_dir
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_default();
+            log(
+                "stdout",
+                format!("[launcher] mvn install -DskipTests @ {name}"),
+            );
+            match run_mvn_streaming(
+                &env,
+                &dep_dir,
+                vec!["install".into(), "-DskipTests".into()],
+                &unit.id,
+                &sink,
+            ) {
+                Ok(true) => {
+                    let _ = write_compile_stamp(&dep_dir);
+                    log("stdout", format!("[launcher] install OK: {name}"));
                 }
-                Err(e) => log("stderr", format!("[launcher] {e}")),
+                Ok(false) => {
+                    let msg = format!("install FAILED: {name}");
+                    log("stderr", format!("[launcher] {msg}"));
+                    return Err(msg);
+                }
+                Err(e) => {
+                    log("stderr", format!("[launcher] {e}"));
+                    return Err(e);
+                }
             }
-        });
+        }
+        log("stdout", "[launcher] install local deps finished".into());
         Ok(())
     }
 
-    pub fn stop(&self, app: &AppHandle, unit_id: &str) -> Result<(), String> {
+    pub fn stop(&self, sink: &SharedSink, unit_id: &str) -> Result<(), String> {
         if !self.reclaim_unit(unit_id) {
             // Already gone — still notify UI so status stays consistent
-            let _ = app.emit(
-                "module-status",
-                StatusEvent {
+            sink.emit_module_status(StatusEvent {
                     unit_id: unit_id.to_string(),
                     status: ModuleStatus::Stopped,
                     pid: None,
                     message: Some("not running".into()),
-                },
-            );
+                });
             return Ok(());
         }
 
-        let _ = app.emit(
-            "module-status",
-            StatusEvent {
+        sink.emit_module_status(StatusEvent {
                 unit_id: unit_id.to_string(),
                 status: ModuleStatus::Stopped,
                 pid: None,
                 message: Some("stopped by user".into()),
-            },
-        );
+            });
         Ok(())
     }
 
@@ -496,16 +438,13 @@ impl ProcessManager {
     }
 }
 
-fn ensure_log_slot(app: &AppHandle, unit_id: &str) {
-    let _ = app.emit(
-        "module-status",
-        StatusEvent {
+fn ensure_log_slot(sink: &SharedSink, unit_id: &str) {
+    sink.emit_module_status(StatusEvent {
             unit_id: unit_id.to_string(),
             status: ModuleStatus::Starting,
             pid: None,
             message: Some("building".into()),
-        },
-    );
+        });
 }
 
 fn compile_spring_modules(
@@ -513,7 +452,7 @@ fn compile_spring_modules(
     unit: &Launchable,
     mode: BuildBeforeRun,
     log: &dyn Fn(&str, String),
-    app: &AppHandle,
+    sink: &SharedSink,
 ) -> Result<Vec<(String, PathBuf)>, String> {
     let module_path = normalize_path(&unit.path);
     let workspace = normalize_path(&env.workspace_path);
@@ -539,7 +478,7 @@ fn compile_spring_modules(
                         "[launcher] mvn {goal} -DskipTests (file-incremental) @ {name}"
                     ),
                 );
-                let ok = run_mvn_file_incremental(env, dir, goal, &unit.id, app)?;
+                let ok = run_mvn_file_incremental(env, dir, goal, &unit.id, sink)?;
                 if !ok {
                     return Err(format!("{goal} FAILED: {name}"));
                 }
@@ -563,7 +502,7 @@ fn compile_spring_modules(
                             m2_jar.display()
                         ),
                     );
-                    install_local_dep_fast(env, dir, &gav, &mvn, &unit.id, app, log)?;
+                    install_local_dep_fast(env, dir, &gav, &mvn, &unit.id, sink, log)?;
                     return Ok(());
                 }
                 log(
@@ -572,7 +511,7 @@ fn compile_spring_modules(
                         "[launcher] mvn {goal} -DskipTests (file-incremental) @ {name}"
                     ),
                 );
-                let ok = run_mvn_file_incremental(env, dir, goal, &unit.id, app)?;
+                let ok = run_mvn_file_incremental(env, dir, goal, &unit.id, sink)?;
                 if !ok {
                     return Err(format!("{goal} FAILED: {name}"));
                 }
@@ -655,7 +594,7 @@ fn install_local_dep_fast(
     gav: &ProjectGav,
     mvn: &Path,
     unit_id: &str,
-    app: &AppHandle,
+    sink: &SharedSink,
     log: &dyn Fn(&str, String),
 ) -> Result<(), String> {
     ensure_classes_exist(module_dir)?;
@@ -674,7 +613,7 @@ fn install_local_dep_fast(
             mvn,
             &["-q".into(), "jar:jar".into()],
             unit_id,
-            app,
+            sink,
         )?;
         if !ok {
             return Err(format!("jar:jar FAILED: {}", gav.artifact_id));
@@ -703,7 +642,7 @@ fn install_local_dep_fast(
             gav.group_id, gav.artifact_id, gav.version
         ),
     );
-    let ok = run_command_streaming(env, module_dir, mvn, &args, unit_id, app)?;
+    let ok = run_command_streaming(env, module_dir, mvn, &args, unit_id, sink)?;
     if !ok {
         return Err(format!("install:install-file FAILED: {}", gav.artifact_id));
     }
@@ -729,7 +668,7 @@ fn normalize_spring_profile(profile: &str) -> Option<String> {
 
 fn prepare_and_run_spring_boot(
     mgr: &Arc<ProcessManager>,
-    app: &AppHandle,
+    sink: &SharedSink,
     env: &RuntimeEnv,
     unit: &Launchable,
     build_mode: BuildBeforeRun,
@@ -741,7 +680,7 @@ fn prepare_and_run_spring_boot(
     let module_path = normalize_path(&unit.path);
     let mvn = resolve_mvn_bin(env);
 
-    let local_deps = compile_spring_modules(env, unit, build_mode, log, app)?;
+    let local_deps = compile_spring_modules(env, unit, build_mode, log, sink)?;
 
     let main_class = unit
         .detail
@@ -758,7 +697,7 @@ fn prepare_and_run_spring_boot(
             Path::new(&module_path),
             &local_deps,
             &unit.id,
-            app,
+            sink,
         )?;
         if hot_reload {
             match ensure_devtools_on_classpath(env, Path::new(&module_path), &classpath, log) {
@@ -820,7 +759,7 @@ fn prepare_and_run_spring_boot(
         );
         spawn_long_running(
             mgr,
-            app,
+            sink,
             env,
             &unit.id,
             Path::new(&module_path),
@@ -852,7 +791,7 @@ fn prepare_and_run_spring_boot(
         }
         spawn_long_running(
             mgr,
-            app,
+            sink,
             env,
             &unit.id,
             Path::new(&module_path),
@@ -868,7 +807,7 @@ fn build_runtime_classpath(
     module_dir: &Path,
     local_deps: &[(String, PathBuf)],
     unit_id: &str,
-    app: &AppHandle,
+    sink: &SharedSink,
 ) -> Result<String, String> {
     let sep = if cfg!(windows) { ";" } else { ":" };
     let cp_file = module_dir.join(".launcher-classpath.txt");
@@ -879,7 +818,7 @@ fn build_runtime_classpath(
         format!("-Dmdep.pathSeparator={sep}"),
         "-DincludeScope=runtime".into(),
     ];
-    let ok = run_command_streaming(env, module_dir, &mvn, &args, unit_id, app)?;
+    let ok = run_command_streaming(env, module_dir, &mvn, &args, unit_id, sink)?;
     if !ok {
         return Err("dependency:build-classpath failed".into());
     }
@@ -974,7 +913,7 @@ fn write_devtools_sharding_bridge_props(
     // Properties file: `\\` → `\`; regex needs `\w` and `\.`
     let content = "\
 # Generated by SparkRun when DevTools hot-reload is enabled.\n\
-# Keep ShardingSphere in RestartClassLoader with app code (CLASS_BASED + SpringUtil).\n\
+# Keep ShardingSphere in RestartClassLoader with sink code (CLASS_BASED + SpringUtil).\n\
 restart.include.shardingsphere=/shardingsphere-[\\\\w.-]+\\\\.jar\n\
 ";
     fs::write(&props, content).map_err(|e| format!("write {}: {e}", props.display()))?;
@@ -1023,7 +962,7 @@ fn run_mvn_file_incremental(
     module_dir: &Path,
     goal: &str,
     unit_id: &str,
-    app: &AppHandle,
+    sink: &SharedSink,
 ) -> Result<bool, String> {
     let mvn = resolve_mvn_bin(env);
     let args = vec![
@@ -1031,14 +970,14 @@ fn run_mvn_file_incremental(
         "-DskipTests".into(),
         MVN_FILE_INCREMENTAL.into(),
     ];
-    run_command_streaming(env, module_dir, &mvn, &args, unit_id, app)
+    run_command_streaming(env, module_dir, &mvn, &args, unit_id, sink)
 }
 
 fn mvn_incremental_compile(
     env: &RuntimeEnv,
     module_dir: &Path,
     unit_id: &str,
-    app: &AppHandle,
+    sink: &SharedSink,
     log: &dyn Fn(&str, String),
 ) -> Result<bool, String> {
     log(
@@ -1048,7 +987,7 @@ fn mvn_incremental_compile(
             module_dir.display()
         ),
     );
-    run_mvn_file_incremental(env, module_dir, "compile", unit_id, app)
+    run_mvn_file_incremental(env, module_dir, "compile", unit_id, sink)
 }
 
 /// Compile classpath for javac: `target/classes` + local dep classes + Maven jars (cached vs pom).
@@ -1057,7 +996,7 @@ fn ensure_compile_classpath(
     workspace: &Path,
     module_dir: &Path,
     unit_id: &str,
-    app: &AppHandle,
+    sink: &SharedSink,
     log: &dyn Fn(&str, String),
 ) -> Result<String, String> {
     let sep = if cfg!(windows) { ";" } else { ":" };
@@ -1095,7 +1034,7 @@ fn ensure_compile_classpath(
             format!("-Dmdep.pathSeparator={sep}"),
             "-DincludeScope=compile".into(),
         ];
-        let ok = run_command_streaming(env, &module_dir, &mvn, &args, unit_id, app)?;
+        let ok = run_command_streaming(env, &module_dir, &mvn, &args, unit_id, sink)?;
         if !ok {
             let _ = fs::remove_file(&tmp);
             return Err("dependency:build-classpath (compile) failed".into());
@@ -1160,7 +1099,7 @@ fn javac_single_java_file(
     module_dir: &Path,
     java_file: &Path,
     unit_id: &str,
-    app: &AppHandle,
+    sink: &SharedSink,
     log: &dyn Fn(&str, String),
 ) -> Result<(), String> {
     let module_dir = PathBuf::from(normalize_path(&module_dir.to_string_lossy()));
@@ -1169,7 +1108,7 @@ fn javac_single_java_file(
     if !classes.is_dir() {
         return Err(format!("missing {}", classes.display()));
     }
-    let cp = ensure_compile_classpath(env, workspace, &module_dir, unit_id, app, log)?;
+    let cp = ensure_compile_classpath(env, workspace, &module_dir, unit_id, sink, log)?;
     let javac = resolve_javac_bin(env);
     // Use @argfile to avoid Windows CreateProcess / command-line length limits.
     let argfile = module_dir.join(".launcher-javac.args");
@@ -1201,7 +1140,7 @@ fn javac_single_java_file(
     );
 
     let at_arg = format!("@{}", path_for_javac_arg(&argfile));
-    let ok = run_command_streaming(env, &module_dir, &javac, &[at_arg], unit_id, app)?;
+    let ok = run_command_streaming(env, &module_dir, &javac, &[at_arg], unit_id, sink)?;
     let _ = fs::remove_file(&argfile);
     if !ok {
         return Err("javac failed".into());
@@ -1294,7 +1233,7 @@ fn fetch_devtools_jar(env: &RuntimeEnv, module_dir: &Path, ver: &str) -> Result<
 
 fn prepare_and_run_vue(
     mgr: &Arc<ProcessManager>,
-    app: &AppHandle,
+    sink: &SharedSink,
     env: &RuntimeEnv,
     unit: &Launchable,
     log: &dyn Fn(&str, String),
@@ -1319,7 +1258,7 @@ fn prepare_and_run_vue(
             &inv.program,
             &install_args,
             &unit.id,
-            app,
+            sink,
         )?;
         if !ok {
             return Err(format!("{pm} install failed"));
@@ -1333,7 +1272,7 @@ fn prepare_and_run_vue(
     // Embedded PTY → in-app xterm (not a popup console).
     spawn_embedded_pty(
         mgr,
-        app,
+        sink,
         env,
         &unit.id,
         Path::new(&module_path),
@@ -1356,17 +1295,14 @@ fn clear_marker(mgr: &ProcessManager, unit_id: &str) {
     }
 }
 
-fn finish_failed(mgr: &ProcessManager, app: &AppHandle, unit_id: &str) {
+fn finish_failed(mgr: &ProcessManager, sink: &SharedSink, unit_id: &str) {
     clear_marker(mgr, unit_id);
-    let _ = app.emit(
-        "module-status",
-        StatusEvent {
+    sink.emit_module_status(StatusEvent {
             unit_id: unit_id.to_string(),
             status: ModuleStatus::Failed,
             pid: None,
             message: Some("start failed".into()),
-        },
-    );
+        });
 }
 
 fn spawn_marker(env: &RuntimeEnv) -> Result<Child, String> {
@@ -1398,11 +1334,11 @@ fn run_mvn_streaming(
     cwd: &Path,
     args: Vec<String>,
     unit_id: &str,
-    app: &AppHandle,
+    sink: &SharedSink,
 ) -> Result<bool, String> {
     let mvn = resolve_mvn_bin(env);
     // settings (-s) injected once inside run_command_streaming
-    run_command_streaming(env, cwd, &mvn, &args, unit_id, app)
+    run_command_streaming(env, cwd, &mvn, &args, unit_id, sink)
 }
 
 fn run_command_streaming(
@@ -1411,7 +1347,7 @@ fn run_command_streaming(
     program: &Path,
     args: &[String],
     unit_id: &str,
-    app: &AppHandle,
+    sink: &SharedSink,
 ) -> Result<bool, String> {
     // If invoking Maven, inject -s settings.xml for repo overrides
     let effective_args = if program
@@ -1444,35 +1380,29 @@ fn run_command_streaming(
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
 
-    let app_out = app.clone();
+    let sink_out = Arc::clone(&sink);
     let id_out = unit_id.to_string();
     let t_out = std::thread::spawn(move || {
         if let Some(out) = stdout {
             for line in BufReader::new(out).lines().flatten() {
-                let _ = app_out.emit(
-                    "module-log",
-                    LogEvent {
+                sink_out.emit_module_log(LogEvent {
                         unit_id: id_out.clone(),
                         stream: "stdout".into(),
                         line,
-                    },
-                );
+                    });
             }
         }
     });
-    let app_err = app.clone();
+    let sink_err = Arc::clone(&sink);
     let id_err = unit_id.to_string();
     let t_err = std::thread::spawn(move || {
         if let Some(err) = stderr {
             for line in BufReader::new(err).lines().flatten() {
-                let _ = app_err.emit(
-                    "module-log",
-                    LogEvent {
+                sink_err.emit_module_log(LogEvent {
                         unit_id: id_err.clone(),
                         stream: "stderr".into(),
                         line,
-                    },
-                );
+                    });
             }
         }
     });
@@ -1485,7 +1415,7 @@ fn run_command_streaming(
 
 fn spawn_long_running(
     mgr: &Arc<ProcessManager>,
-    app: &AppHandle,
+    sink: &SharedSink,
     env: &RuntimeEnv,
     unit_id: &str,
     cwd: &Path,
@@ -1528,57 +1458,48 @@ fn spawn_long_running(
         guard.insert(unit_id.to_string(), ManagedProcess::Piped { child });
     }
 
-    let _ = app.emit(
-        "module-status",
-        StatusEvent {
+    sink.emit_module_status(StatusEvent {
             unit_id: unit_id.to_string(),
             status: ModuleStatus::Running,
             pid: Some(pid),
             message: None,
-        },
-    );
+        });
 
     if let Some(out) = stdout {
-        let app2 = app.clone();
+        let sink2 = Arc::clone(&sink);
         let id2 = unit_id.to_string();
         std::thread::spawn(move || {
             for line in BufReader::new(out).lines().flatten() {
-                let _ = app2.emit(
-                    "module-log",
-                    LogEvent {
+                sink2.emit_module_log(LogEvent {
                         unit_id: id2.clone(),
                         stream: "stdout".into(),
                         line,
-                    },
-                );
+                    });
             }
         });
     }
     if let Some(err) = stderr {
-        let app2 = app.clone();
+        let sink2 = Arc::clone(&sink);
         let id2 = unit_id.to_string();
         std::thread::spawn(move || {
             for line in BufReader::new(err).lines().flatten() {
-                let _ = app2.emit(
-                    "module-log",
-                    LogEvent {
+                sink2.emit_module_log(LogEvent {
                         unit_id: id2.clone(),
                         stream: "stderr".into(),
                         line,
-                    },
-                );
+                    });
             }
         });
     }
 
-    watch_child_exit(mgr, app, unit_id);
+    watch_child_exit(mgr, sink, unit_id);
     Ok(())
 }
 
 /// Vue/npm in an embedded PTY; bytes stream to frontend xterm via `module-term`.
 fn spawn_embedded_pty(
     mgr: &Arc<ProcessManager>,
-    app: &AppHandle,
+    sink: &SharedSink,
     env: &RuntimeEnv,
     unit_id: &str,
     cwd: &Path,
@@ -1586,7 +1507,7 @@ fn spawn_embedded_pty(
     args: &[String],
 ) -> Result<(), String> {
     let session = crate::pty_session::PtySession::spawn(
-        app.clone(),
+        Arc::clone(&sink),
         unit_id.to_string(),
         env,
         cwd,
@@ -1602,23 +1523,20 @@ fn spawn_embedded_pty(
         guard.insert(unit_id.to_string(), ManagedProcess::Pty(session));
     }
 
-    let _ = app.emit(
-        "module-status",
-        StatusEvent {
+    sink.emit_module_status(StatusEvent {
             unit_id: unit_id.to_string(),
             status: ModuleStatus::Running,
             pid: if pid == 0 { None } else { Some(pid) },
             message: Some("pty".into()),
-        },
-    );
+        });
 
-    watch_child_exit(mgr, app, unit_id);
+    watch_child_exit(mgr, sink, unit_id);
     Ok(())
 }
 
-fn watch_child_exit(mgr: &Arc<ProcessManager>, app: &AppHandle, unit_id: &str) {
+fn watch_child_exit(mgr: &Arc<ProcessManager>, sink: &SharedSink, unit_id: &str) {
     let mgr2 = Arc::clone(mgr);
-    let app2 = app.clone();
+    let sink2 = Arc::clone(&sink);
     let id2 = unit_id.to_string();
     std::thread::spawn(move || {
         let success = loop {
@@ -1644,9 +1562,7 @@ fn watch_child_exit(mgr: &Arc<ProcessManager>, app: &AppHandle, unit_id: &str) {
             let mut guard = mgr2.inner.lock().unwrap();
             guard.remove(&id2);
         }
-        let _ = app2.emit(
-            "module-status",
-            StatusEvent {
+        sink2.emit_module_status(StatusEvent {
                 unit_id: id2,
                 status: if success {
                     ModuleStatus::Stopped
@@ -1655,8 +1571,7 @@ fn watch_child_exit(mgr: &Arc<ProcessManager>, app: &AppHandle, unit_id: &str) {
                 },
                 pid: None,
                 message: None,
-            },
-        );
+            });
     });
 }
 

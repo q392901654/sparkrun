@@ -1,9 +1,11 @@
 use crate::store::{find_project, load_projects};
+use sparkrun_core::job::{JobPriority, JobQueue};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use serde::Serialize;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
-use tauri::AppHandle;
+use std::sync::Arc;
+use tauri::{AppHandle, State};
 
 fn image_mime(path: &Path) -> Option<&'static str> {
     let ext = path
@@ -66,7 +68,6 @@ pub(crate) fn resolve_under_root(root: &Path, path: &str) -> Result<PathBuf, Str
     if !canon.starts_with(&root) {
         return Err("path outside project root".into());
     }
-    // Reject weird components after canonicalize (should already be clean)
     for c in canon.components() {
         if matches!(c, Component::ParentDir) {
             return Err("invalid path".into());
@@ -81,10 +82,8 @@ pub(crate) fn project_root(app: &AppHandle, project_id: &str) -> Result<PathBuf,
     Ok(PathBuf::from(&project.root_path))
 }
 
-#[tauri::command]
-pub fn read_text_file(app: AppHandle, project_id: String, path: String) -> Result<String, String> {
-    let root = project_root(&app, &project_id)?;
-    let file = resolve_under_root(&root, &path)?;
+fn read_text_file_inner(root: &Path, path: &str) -> Result<String, String> {
+    let file = resolve_under_root(root, path)?;
     if !file.is_file() {
         return Err("not a file".into());
     }
@@ -92,33 +91,72 @@ pub fn read_text_file(app: AppHandle, project_id: String, path: String) -> Resul
         return Err("binary image — use read_image_data_url".into());
     }
     let meta = fs::metadata(&file).map_err(|e| format!("stat: {e}"))?;
-    // Soft limit ~8 MiB to avoid freezing UI
     if meta.len() > 8 * 1024 * 1024 {
         return Err("file too large (>8MB)".into());
     }
     fs::read_to_string(&file).map_err(|e| format!("read: {e}"))
 }
 
-/// Read a common image as a `data:` URL for in-app preview (no asset protocol required).
-#[tauri::command]
-pub fn read_image_data_url(
-    app: AppHandle,
-    project_id: String,
-    path: String,
-) -> Result<String, String> {
-    let root = project_root(&app, &project_id)?;
-    let file = resolve_under_root(&root, &path)?;
+fn read_image_inner(root: &Path, path: &str) -> Result<String, String> {
+    let file = resolve_under_root(root, path)?;
     if !file.is_file() {
         return Err("not a file".into());
     }
     let mime = image_mime(&file).ok_or_else(|| "not a supported image".to_string())?;
     let meta = fs::metadata(&file).map_err(|e| format!("stat: {e}"))?;
-    // Soft limit ~12 MiB for preview
     if meta.len() > 12 * 1024 * 1024 {
         return Err("image too large (>12MB)".into());
     }
     let bytes = fs::read(&file).map_err(|e| format!("read: {e}"))?;
     Ok(format!("data:{mime};base64,{}", STANDARD.encode(bytes)))
+}
+
+#[tauri::command]
+pub async fn read_text_file(
+    app: AppHandle,
+    queue: State<'_, Arc<JobQueue>>,
+    project_id: String,
+    path: String,
+) -> Result<String, String> {
+    let root = project_root(&app, &project_id)?;
+    let name = Path::new(&path)
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.clone());
+    queue
+        .run(
+            "fs",
+            &format!("读取 · {name}"),
+            None,
+            JobPriority::Low,
+            false,
+            move |_| read_text_file_inner(&root, &path),
+        )
+        .await
+}
+
+#[tauri::command]
+pub async fn read_image_data_url(
+    app: AppHandle,
+    queue: State<'_, Arc<JobQueue>>,
+    project_id: String,
+    path: String,
+) -> Result<String, String> {
+    let root = project_root(&app, &project_id)?;
+    let name = Path::new(&path)
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.clone());
+    queue
+        .run(
+            "fs",
+            &format!("读取图片 · {name}"),
+            None,
+            JobPriority::Low,
+            false,
+            move |_| read_image_inner(&root, &path),
+        )
+        .await
 }
 
 #[tauri::command]
@@ -129,7 +167,6 @@ pub fn write_text_file(
     content: String,
 ) -> Result<(), String> {
     let root = project_root(&app, &project_id)?;
-    // For new files, parent must exist under root; canonicalize file may fail if missing.
     let raw = PathBuf::from(&path);
     let candidate = if raw.is_absolute() {
         raw.clone()
@@ -154,8 +191,6 @@ pub fn write_text_file(
     fs::write(&candidate, content.as_bytes()).map_err(|e| format!("write: {e}"))
 }
 
-/// List directory entries under project root; when `base_path` is set, path must also stay under it
-/// (used for module-scoped file trees).
 #[tauri::command]
 pub fn list_dir(
     app: AppHandle,
@@ -178,19 +213,13 @@ pub fn list_dir(
     let mut entries: Vec<DirEntryDto> = Vec::new();
     let rd = fs::read_dir(&dir).map_err(|e| format!("read_dir: {e}"))?;
     for ent in rd {
-        let ent = ent.map_err(|e| format!("dir entry: {e}"))?;
+        let ent = ent.map_err(|e| format!("read_dir entry: {e}"))?;
         let name = ent.file_name().to_string_lossy().to_string();
-        if name == "." || name == ".." {
+        if should_skip_dir_name(&name) {
             continue;
         }
-        let meta = match ent.metadata() {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
+        let meta = ent.metadata().map_err(|e| format!("metadata: {e}"))?;
         let is_dir = meta.is_dir();
-        if is_dir && should_skip_dir_name(&name) {
-            continue;
-        }
         let full = ent.path();
         entries.push(DirEntryDto {
             name,
